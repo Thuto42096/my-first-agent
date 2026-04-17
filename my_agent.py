@@ -1,29 +1,38 @@
-# my_agent.py
 """CryptoScout — a Strands agent that produces rule-based crypto trading signals.
 
-Data sources :
-  - CoinGecko simple/price   -> current spot price & 24h change
-  - Binance klines (public)  -> OHLCV candles for indicator computation
+Data sources (no API key required):
+  - CoinGecko /simple/price  -> current spot price & 24h change
+  - Binance  /api/v3/klines  -> OHLCV candles for indicator computation
 
-Indicators :
-  - RSI(14)                  - Wilder's smoothing
-  - MACD(12, 26, 9)          - EMA-based
-  - SMA(50) / SMA(200)       - trend filter
+Indicators (computed in-process with pandas):
+  - RSI(14)          - Wilder's smoothing via EWM(alpha=1/length)
+  - MACD(12, 26, 9)  - EMA-based momentum + signal line + histogram
+  - SMA(50) / SMA(200) - classic trend filter ("golden/death cross")
 
+Requires a Gemini API key in the GEMINI_API_KEY (or GOOGLE_API_KEY) env var.
+Educational use only. Not financial advice.
 """
 
 from __future__ import annotations
 
-import requests
 import pandas as pd
+import requests
 from strands import Agent, tool
 from strands.models.gemini import GeminiModel
 from strands_tools import calculator, http_request
 
+# --- Scoring thresholds (tune these to change signal sensitivity) -----------
 
-# --- Indicator helpers ---
+RSI_OVERSOLD = 30       # RSI below this contributes +1 to the score (bullish)
+RSI_OVERBOUGHT = 70     # RSI above this contributes -1 (bearish)
+BUY_THRESHOLD = 2       # score >=  BUY_THRESHOLD  -> BUY
+SELL_THRESHOLD = -2     # score <= SELL_THRESHOLD  -> SELL
+
+
+# --- Indicator helpers ------------------------------------------------------
 
 def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """Relative Strength Index using Wilder's smoothing."""
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -33,7 +42,10 @@ def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def _macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+def _macd(
+    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD line, signal line, histogram (all aligned to `close`'s index)."""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -95,6 +107,7 @@ def technical_indicators(binance_symbol: str, interval: str = "1h") -> dict:
         binance_symbol: Binance pair, e.g. 'BTCUSDT'.
         interval: Candle timeframe (default '1h'). Use '4h' or '1d' for swing signals.
     """
+    # Pull 300 candles so SMA(200) has enough warm-up room
     candles = get_ohlcv(binance_symbol, interval, 300)
     df = pd.DataFrame(candles, columns=["t", "o", "h", "l", "c", "v"])
     close = df["c"]
@@ -104,28 +117,40 @@ def technical_indicators(binance_symbol: str, interval: str = "1h") -> dict:
     df["sma50"] = close.rolling(50).mean()
     df["sma200"] = close.rolling(200).mean()
 
+    # Evaluate the three rules on the most recent closed candle
     last = df.iloc[-1]
     reasons: list[str] = []
     score = 0
 
-    if last["rsi"] < 30:
-        score += 1; reasons.append(f"RSI {last['rsi']:.1f} oversold (<30)")
-    elif last["rsi"] > 70:
-        score -= 1; reasons.append(f"RSI {last['rsi']:.1f} overbought (>70)")
+    if last["rsi"] < RSI_OVERSOLD:
+        score += 1
+        reasons.append(f"RSI {last['rsi']:.1f} oversold (<{RSI_OVERSOLD})")
+    elif last["rsi"] > RSI_OVERBOUGHT:
+        score -= 1
+        reasons.append(f"RSI {last['rsi']:.1f} overbought (>{RSI_OVERBOUGHT})")
     else:
         reasons.append(f"RSI {last['rsi']:.1f} neutral")
 
     if last["macd"] > last["macd_sig"]:
-        score += 1; reasons.append("MACD above signal (bullish momentum)")
+        score += 1
+        reasons.append("MACD above signal (bullish momentum)")
     else:
-        score -= 1; reasons.append("MACD below signal (bearish momentum)")
+        score -= 1
+        reasons.append("MACD below signal (bearish momentum)")
 
     if last["sma50"] > last["sma200"]:
-        score += 1; reasons.append("SMA50 > SMA200 (bullish trend)")
+        score += 1
+        reasons.append("SMA50 > SMA200 (bullish trend)")
     else:
-        score -= 1; reasons.append("SMA50 < SMA200 (bearish trend)")
+        score -= 1
+        reasons.append("SMA50 < SMA200 (bearish trend)")
 
-    signal = "BUY" if score >= 2 else "SELL" if score <= -2 else "HOLD"
+    if score >= BUY_THRESHOLD:
+        signal = "BUY"
+    elif score <= SELL_THRESHOLD:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
 
     return {
         "symbol": binance_symbol.upper(),
